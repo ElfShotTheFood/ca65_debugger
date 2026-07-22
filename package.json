@@ -1,0 +1,42 @@
+{
+  "name": "ca65-debugger",
+  "displayName": "ca65 Debugger",
+  "description": "Debugger for ca65 assembly using VICE",
+  "version": "0.0.1",
+  "publisher": "vscode",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "ca65"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "vice",
+        "label": "VICE Debugger",
+        "program": "./out/debugAdapter.js",
+        "runtime": "node"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "18.15.11",
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@vscode/debugadapter": "*",
+    "vscode-debugprotocol": "*",
+    "await-notify": "^1.0.1"
+  }
+}
