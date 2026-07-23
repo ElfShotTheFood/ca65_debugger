@@ -34,6 +34,10 @@ export class ViceDebugSession extends DebugSession {
     private programStarted = false;
     private lastStoppedAddress: number | undefined;
     private lastRegisters: { [key: string]: string } = {};
+    /** Processor status (P) as a numeric byte, when known. */
+    private lastP: number | undefined;
+    private static readonly P_FLAGS_REF = 2;
+    private static readonly FLAG_NAMES = ['N', 'V', '-', 'B', 'D', 'I', 'Z', 'C'] as const;
 
     public constructor() {
         super();
@@ -69,11 +73,39 @@ export class ViceDebugSession extends DebugSession {
     protected variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): void {
         const variables: DebugProtocol.Variable[] = [];
         if (args.variablesReference === 1) {
-            for (const [key, value] of Object.entries(this.lastRegisters)) {
-                variables.push({ name: key, value: value, variablesReference: 0 });
-            }
+            // Display order: PC, SP, A, X, Y, P
             if (this.lastStoppedAddress !== undefined) {
                 variables.push({ name: 'PC', value: '$' + this.lastStoppedAddress.toString(16).padStart(4, '0'), variablesReference: 0 });
+            }
+            for (const key of ['SP', 'A', 'X', 'Y'] as const) {
+                const value = this.lastRegisters[key];
+                if (value !== undefined) {
+                    variables.push({ name: key, value, variablesReference: 0 });
+                }
+            }
+            if (this.lastRegisters['P'] !== undefined || this.lastP !== undefined) {
+                const pValue = this.lastRegisters['P']
+                    ?? (this.lastP !== undefined ? '$' + this.lastP.toString(16).padStart(2, '0') : undefined);
+                if (pValue !== undefined) {
+                    variables.push({
+                        name: 'P',
+                        value: pValue,
+                        variablesReference: ViceDebugSession.P_FLAGS_REF,
+                        namedVariables: ViceDebugSession.FLAG_NAMES.length
+                    });
+                }
+            }
+        } else if (args.variablesReference === ViceDebugSession.P_FLAGS_REF) {
+
+            const p = this.lastP ?? 0;
+            for (let i = 0; i < ViceDebugSession.FLAG_NAMES.length; i++) {
+                const bit = 7 - i;
+                const set = (p & (1 << bit)) !== 0;
+                variables.push({
+                    name: ViceDebugSession.FLAG_NAMES[i],
+                    value: set ? '1' : '0',
+                    variablesReference: 0
+                });
             }
         }
         response.body = { variables };
@@ -302,9 +334,41 @@ export class ViceDebugSession extends DebugSession {
         for (const line of lines) {
             const text = line.trim();
             if (text) this.output(`VICE => ${text}`);
-            const regMatch = /A:([0-9a-f]{2})\s+X:([0-9a-f]{2})\s+Y:([0-9a-f]{2})\s+SP:([0-9a-f]{2})/i.exec(text);
+            // Typical VICE stop line:
+            //   .C:0401  A:00 X:00 Y:00 SP:f6 ..-...Z.  00 001014
+            // or with letters for set flags / P hex:
+            //   A:00 X:00 Y:00 SP:f6 P:30 NV-BDIZC
+            const regMatch = /A:([0-9a-f]{2})\s+X:([0-9a-f]{2})\s+Y:([0-9a-f]{2})\s+SP:([0-9a-f]{2})(?:\s+(?:P:\$?([0-9a-f]{2})\s*)?([NVBDIZC.\-]{8}))?/i.exec(text);
             if (regMatch) {
-                this.lastRegisters = { A: '$' + regMatch[1], X: '$' + regMatch[2], Y: '$' + regMatch[3], SP: '$' + regMatch[4] };
+                this.lastRegisters = {
+                    A: '$' + regMatch[1],
+                    X: '$' + regMatch[2],
+                    Y: '$' + regMatch[3],
+                    SP: '$' + regMatch[4]
+                };
+                const pHex = regMatch[5];
+                const flagStr = regMatch[6];
+                if (pHex !== undefined) {
+                    this.lastP = Number.parseInt(pHex, 16);
+                } else if (flagStr !== undefined) {
+                    this.lastP = this.flagsStringToByte(flagStr);
+                } else {
+                    // Fall back: some VICE builds print flags elsewhere on the line.
+                    const looseFlags = /\s([NVBDIZC.\-]{8})(?:\s|$)/i.exec(text);
+                    if (looseFlags) {
+                        this.lastP = this.flagsStringToByte(looseFlags[1]);
+                    }
+                }
+                if (this.lastP !== undefined) {
+                    this.lastRegisters['P'] = '$' + this.lastP.toString(16).padStart(2, '0');
+                }
+            } else {
+                // Standalone P:xx if registers were already known
+                const pOnly = /\bP:\$?([0-9a-f]{2})\b/i.exec(text);
+                if (pOnly) {
+                    this.lastP = Number.parseInt(pOnly[1], 16);
+                    this.lastRegisters['P'] = '$' + this.lastP.toString(16).padStart(2, '0');
+                }
             }
             const stoppedAt = /(?:\b|\()C:\$([0-9a-f]{4,6})\)/i.exec(text) || /^\.C:([0-9a-f]{4})/i.exec(text);
             if (stoppedAt) {
@@ -318,6 +382,21 @@ export class ViceDebugSession extends DebugSession {
 
     private output(message: string, category: 'stdout' | 'stderr' = 'stdout'): void {
         this.sendEvent(new OutputEvent(`${message}\n`, category));
+    }
+
+    /**
+     * Convert a VICE NV-BDIZC flag string into a P status byte.
+     * Set flags are shown as their letter (or '-' for bit 5); clear flags as '.'.
+     */
+    private flagsStringToByte(flagStr: string): number {
+        let p = 0;
+        const s = flagStr.toUpperCase();
+        for (let i = 0; i < 8 && i < s.length; i++) {
+            if (s[i] !== '.') {
+                p |= (1 << (7 - i));
+            }
+        }
+        return p;
     }
 }
 
