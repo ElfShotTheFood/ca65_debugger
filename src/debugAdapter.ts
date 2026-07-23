@@ -9,6 +9,7 @@ interface DebugSpan {
     segmentId: number;
     offset: number;
 }
+enum StepOutStage { Idle, ReadingLow, ReadingHigh, Armed }
 
 interface SourceLine {
     fileId: string;
@@ -35,7 +36,10 @@ export class ViceDebugSession extends DebugSession {
     private lastStoppedAddress: number | undefined;
     private stepInProgress = false;
     private stepOverState: { waitingForDisassembly: boolean; address: number; remaining: number } | undefined;
-    private stepOutStartDepth: number | undefined;
+    private stepOutStage = StepOutStage.Idle;
+    private temporaryBreakpoint: number | undefined;
+    private stepOutLow: number | undefined;
+    private stepOutLastAddr: number | undefined;
     private lastRegisters: { [key: string]: string } = {};
 
     public constructor() {
@@ -58,7 +62,6 @@ export class ViceDebugSession extends DebugSession {
     protected dispatchRequest(request: DebugProtocol.Request): void {
         this.output(`DEBUG: PROTOCOL RECEIVED command=${request.command} args=${JSON.stringify(request.arguments)}`);
         
-        // Manual override for 'next' to bypass problematic library handling
         if (request.command === 'next') {
             this.nextRequest(
                 {
@@ -252,13 +255,11 @@ export class ViceDebugSession extends DebugSession {
     protected nextRequest(response: DebugProtocol.NextResponse, _args: DebugProtocol.NextArguments): void {
         this.output("DEBUG: NextRequest (Step Over) RECEIVED");
         this.stepInProgress = true;
-        // In Step Over, we now read memory at PC instead of using brittle 'dis 1'
         if (this.lastStoppedAddress !== undefined) {
             const pc = this.lastStoppedAddress;
             this.stepOverState = { waitingForDisassembly: true, address: pc, remaining: 1 };
             this.sendViceCommand(`m ${pc.toString(16).padStart(4, '0')} ${pc.toString(16).padStart(4, '0')}`);
         } else {
-            // Fallback if PC unknown
             this.sendViceCommand('z');
         }
         this.sendResponse(response);
@@ -266,14 +267,21 @@ export class ViceDebugSession extends DebugSession {
 
     protected stepOutRequest(response: DebugProtocol.StepOutResponse, _args: DebugProtocol.StepOutArguments): void {
         this.output("DEBUG: StepOutRequest RECEIVED");
-        this.stepInProgress = false;
-        this.stepOverState = undefined;
-        this.sendViceCommand('z');
+        const spHex = this.lastRegisters['SP']?.replace('$', '');
+        if (spHex) {
+            const sp = parseInt(spHex, 16);
+            const lowAddr = (0x0100 + sp + 1) & 0xFFFF;
+            const highAddr = (0x0100 + sp + 2) & 0xFFFF;
+            this.stepOutStage = StepOutStage.ReadingLow;
+            this.stepOutLow = undefined;
+            this.output(`Step Out: Reading return address from stack at $${lowAddr.toString(16)} and $${highAddr.toString(16)} (SP=$${spHex})`);
+            this.sendViceCommand(`m ${lowAddr.toString(16).padStart(4, '0')} ${lowAddr.toString(16).padStart(4, '0')}`);
+            this.sendViceCommand(`m ${highAddr.toString(16).padStart(4, '0')} ${highAddr.toString(16).padStart(4, '0')}`);
+        } else {
+            this.output("Step Out: Could not determine SP, falling back to step", 'stderr');
+            this.sendViceCommand('z');
+        }
         this.sendResponse(response);
-    }
-
-    private requestStepDecision(): void {
-        this.sendViceCommand('dis 1');
     }
 
     protected configurationDoneRequest(response: DebugProtocol.ConfigurationDoneResponse, _args: DebugProtocol.ConfigurationDoneArguments): void {
@@ -343,25 +351,24 @@ export class ViceDebugSession extends DebugSession {
             if (regMatch) {
                 this.lastRegisters = { A: '$' + regMatch[1], X: '$' + regMatch[2], Y: '$' + regMatch[3], SP: '$' + regMatch[4] };
             }
-            const stoppedAt = /(?:\b|\()C:\$([0-9a-f]{4,6})\)/i.exec(text);
+            const stoppedAt = /(?:\b|\()C:\$([0-9a-f]{4,6})\)/i.exec(text) || /^\.C:([0-9a-f]{4})/i.exec(text);
             if (stoppedAt) {
                 this.commandInFlight = false;
                 this.lastStoppedAddress = Number.parseInt(stoppedAt[1], 16);
             }
 
             if (this.stepOverState && this.stepOverState.waitingForDisassembly) {
-                // Look for memory response line: "> 040e 20" or ">C:040e ea"
                 const memMatch = /^\s*>\s*[C:]{0,2}\s*[0-9a-f]{4}\s+([0-9a-f]{2})/i.exec(text);
                 if (memMatch) {
                     const opcode = memMatch[1];
                     this.output(`DEBUG: memory read at PC $${this.stepOverState.address.toString(16)}: opcode $${opcode}`);
 
-                if (opcode === '20') {
-                    const nextAddr = (this.lastStoppedAddress || 0) + 3;
-                    this.output(`Step Over triggered: JSR ($20) detected, setting break at $${nextAddr.toString(16)} then continuing`);
-                    this.sendViceCommand(`break $${nextAddr.toString(16)}`);
-                    this.sendViceCommand('g');
-                } else {
+                    if (opcode === '20') {
+                        const nextAddr = (this.lastStoppedAddress || 0) + 3;
+                        this.output(`Step Over triggered: JSR ($20) detected, setting break at $${nextAddr.toString(16)} then continuing`);
+                        this.sendViceCommand(`break $${nextAddr.toString(16)}`);
+                        this.sendViceCommand('g');
+                    } else {
                         this.output(`Step Over: No JSR, stepping.`);
                         this.sendViceCommand('z');
                     }
@@ -370,16 +377,61 @@ export class ViceDebugSession extends DebugSession {
                 }
             }
 
+            if (this.stepOutStage === StepOutStage.ReadingLow) {
+                const memMatch = /^\s*>\s*[C:]{0,2}\s*[0-9a-f]{4}\s+([0-9a-f]{2})|^([0-9a-f]{2})\s*$/i.exec(text);
+                if (memMatch) {
+                    this.stepOutLow = parseInt(memMatch[1] || memMatch[2], 16);
+                    this.output(`Step Out: Read low byte 0x${this.stepOutLow.toString(16)}`);
+                    const sp = parseInt(this.lastRegisters['SP']?.replace('$', '') || '0', 16);
+                    const highAddr = (0x0100 + sp + 2) & 0xFFFF;
+                    this.stepOutStage = StepOutStage.ReadingHigh;
+                    this.sendViceCommand(`m ${highAddr.toString(16).padStart(4, '0')} ${highAddr.toString(16).padStart(4, '0')}`);
+                    this.flushPendingCommands();
+                }
+            } else if (this.stepOutStage === StepOutStage.ReadingHigh) {
+                const memMatch = /^\s*>\s*[C:]{0,2}\s*[0-9a-f]{4}\s+([0-9a-f]{2})|^([0-9a-f]{2})\s*$/i.exec(text);
+                if (memMatch) {
+                    const val = parseInt(memMatch[1] || memMatch[2], 16);
+                    const high = val;
+                    const low = this.stepOutLow!;
+                    this.stepOutLow = undefined;
+                    
+                    const retAddr = ((high << 8) | low) + 1;
+                    const addrStr = retAddr.toString(16).padStart(4, '0');
+                    this.output(`Step Out: Calculated return address $${addrStr} (from low $${low.toString(16)} and high $${high.toString(16)})`);
+                    this.temporaryBreakpoint = retAddr;
+                    this.stepOutStage = StepOutStage.Armed;
+                    this.sendViceCommand(`break $${addrStr}`);
+                    this.sendViceCommand('g');
+                    this.flushPendingCommands();
+                }
+            }
+
+            const bpMatch = /^(\d+)\.\s+Breakpoint at \$([0-9a-f]{4})/i.exec(text);
+            if (bpMatch) {
+                const id = bpMatch[1];
+                const addr = bpMatch[2];
+                if (this.temporaryBreakpoint !== undefined && addr === this.temporaryBreakpoint.toString(16).padStart(4, '0')) {
+                    this.output(`Breakpoint: Deleting temporary ID ${id} at $${addr}`);
+                    this.sendViceCommand(`del ${id}`);
+                    this.temporaryBreakpoint = undefined;
+                }
+            }
+
             if (stoppedAt && !/BREAK:\s*\d+.*Stop on exec/i.test(text)) {
                 const address = this.lastStoppedAddress!;
-            if (this.stepInProgress) {
-                this.stepInProgress = false;
-                this.output(`VICE completed step at $${address.toString(16)}.`);
-                this.sendEvent(new StoppedEvent('step', 1));
-            } else if (this.armedBreakpointAddresses.has(address)) {
-                this.output(`VICE hit breakpoint at $${address.toString(16)}.`);
-                this.sendEvent(new StoppedEvent('breakpoint', 1));
-            }
+                if (this.stepInProgress) {
+                    this.stepInProgress = false;
+                    this.output(`VICE completed step at $${address.toString(16)}.`);
+                    this.sendEvent(new StoppedEvent('step', 1));
+                } else if (this.armedBreakpointAddresses.has(address)) {
+                    this.output(`VICE hit breakpoint at $${address.toString(16)}.`);
+                    if (this.temporaryBreakpoint === address) {
+                        this.lastStoppedAddress = address;
+                        this.sendViceCommand('breakpoints');
+                    }
+                    this.sendEvent(new StoppedEvent('breakpoint', 1));
+                }
             } else if (stoppedAt && /BREAK:\s*\d+.*Stop on exec/i.test(text)) {
                 this.sendViceCommand('g');
             }
