@@ -34,6 +34,9 @@ export class ViceDebugSession extends DebugSession {
     private programStarted = false;
     private lastStoppedAddress: number | undefined;
     private stepInProgress = false;
+    private stepOverState: { waitingForDisassembly: boolean; address: number; remaining: number } | undefined;
+    private stepOutStartDepth: number | undefined;
+    private lastRegisters: { [key: string]: string } = {};
 
     public constructor() {
         super();
@@ -44,10 +47,58 @@ export class ViceDebugSession extends DebugSession {
     protected initializeRequest(response: DebugProtocol.InitializeResponse, _args: DebugProtocol.InitializeRequestArguments): void {
         response.body = {
             supportsConfigurationDoneRequest: true,
-            supportsTerminateRequest: true
+            supportsTerminateRequest: true,
+            supportsStepInTargetsRequest: true,
+            supportsStepBack: false
         };
         this.sendResponse(response);
         this.sendEvent(new InitializedEvent());
+    }
+
+    protected dispatchRequest(request: DebugProtocol.Request): void {
+        this.output(`DEBUG: PROTOCOL RECEIVED command=${request.command} args=${JSON.stringify(request.arguments)}`);
+        
+        // Manual override for 'next' to bypass problematic library handling
+        if (request.command === 'next') {
+            this.nextRequest(
+                {
+                    seq: 0,
+                    type: 'response',
+                    request_seq: request.seq,
+                    success: true,
+                    command: 'next',
+                    message: '',
+                    body: {}
+                },
+                request.arguments as DebugProtocol.NextArguments
+            );
+            return;
+        }
+
+        super.dispatchRequest(request);
+    }
+
+    protected scopesRequest(response: DebugProtocol.ScopesResponse, _args: DebugProtocol.ScopesArguments): void {
+        response.body = {
+            scopes: [
+                { name: 'Registers', variablesReference: 1, expensive: false }
+            ]
+        };
+        this.sendResponse(response);
+    }
+
+    protected variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): void {
+        const variables: DebugProtocol.Variable[] = [];
+        if (args.variablesReference === 1) {
+            for (const [key, value] of Object.entries(this.lastRegisters)) {
+                variables.push({ name: key, value: value, variablesReference: 0 });
+            }
+            if (this.lastStoppedAddress !== undefined) {
+                variables.push({ name: 'PC', value: '$' + this.lastStoppedAddress.toString(16).padStart(4, '0'), variablesReference: 0 });
+            }
+        }
+        response.body = { variables };
+        this.sendResponse(response);
     }
 
     protected launchRequest(response: DebugProtocol.LaunchResponse, args: any): void {
@@ -61,9 +112,6 @@ export class ViceDebugSession extends DebugSession {
         try {
             const mappings = this.loadDebugSymbols(program);
             this.output(`Loaded ${mappings} source-to-address mappings.`);
-            // Do not use VICE's -autostart option here. It starts the program
-            // before DAP has supplied the breakpoints. configurationDoneRequest
-            // will autostart only after setBreakPointsRequest has run.
             this.programToAutostart = program;
             this.viceProcess = spawn(vicePath, ['-remotemonitor']);
             this.viceProcess.once('error', error => this.output(`Unable to launch VICE: ${error.message}`, 'stderr'));
@@ -101,10 +149,6 @@ export class ViceDebugSession extends DebugSession {
         });
     }
 
-    /**
-     * The .dbg file puts line records before spans/segments.  Parse all records
-     * first, then resolve source lines in a second pass.
-     */
     private loadDebugSymbols(programPath: string): number {
         this.lineAddressMap.clear();
         this.addressSourceMap.clear();
@@ -145,7 +189,6 @@ export class ViceDebugSession extends DebugSession {
             const span = spans.get(sourceLine.spanId);
             const segmentStart = span ? segments.get(span.segmentId) : undefined;
             if (filename && span && segmentStart !== undefined) {
-                // ca65's .dbg line field matches the editor's one-based source line number.
                 const address = segmentStart + span.offset;
                 this.lineAddressMap.set(this.sourceKey(filename, sourceLine.line), address);
                 this.addressSourceMap.set(address, {
@@ -167,7 +210,6 @@ export class ViceDebugSession extends DebugSession {
         return value === undefined ? undefined : Number.parseInt(value, 16);
     }
 
-    // DebugSession's request dispatcher requires the capital-P method name.
     protected setBreakPointsRequest(response: DebugProtocol.SetBreakpointsResponse, args: DebugProtocol.SetBreakpointsArguments): void {
         const filename = args.source.path ? path.basename(args.source.path) : undefined;
         const requested = args.breakpoints ?? [];
@@ -200,11 +242,38 @@ export class ViceDebugSession extends DebugSession {
         this.sendResponse(response);
     }
 
-    /** VICE monitor `z` executes one CPU instruction and returns to the prompt. */
     protected stepInRequest(response: DebugProtocol.StepInResponse, _args: DebugProtocol.StepInArguments): void {
+        this.output("DEBUG: StepInRequest RECEIVED");
         this.stepInProgress = true;
         this.sendViceCommand('z');
         this.sendResponse(response);
+    }
+
+    protected nextRequest(response: DebugProtocol.NextResponse, _args: DebugProtocol.NextArguments): void {
+        this.output("DEBUG: NextRequest (Step Over) RECEIVED");
+        this.stepInProgress = true;
+        // In Step Over, we now read memory at PC instead of using brittle 'dis 1'
+        if (this.lastStoppedAddress !== undefined) {
+            const pc = this.lastStoppedAddress;
+            this.stepOverState = { waitingForDisassembly: true, address: pc, remaining: 1 };
+            this.sendViceCommand(`m ${pc.toString(16).padStart(4, '0')} ${pc.toString(16).padStart(4, '0')}`);
+        } else {
+            // Fallback if PC unknown
+            this.sendViceCommand('z');
+        }
+        this.sendResponse(response);
+    }
+
+    protected stepOutRequest(response: DebugProtocol.StepOutResponse, _args: DebugProtocol.StepOutArguments): void {
+        this.output("DEBUG: StepOutRequest RECEIVED");
+        this.stepInProgress = false;
+        this.stepOverState = undefined;
+        this.sendViceCommand('z');
+        this.sendResponse(response);
+    }
+
+    private requestStepDecision(): void {
+        this.sendViceCommand('dis 1');
     }
 
     protected configurationDoneRequest(response: DebugProtocol.ConfigurationDoneResponse, _args: DebugProtocol.ConfigurationDoneArguments): void {
@@ -258,42 +327,61 @@ export class ViceDebugSession extends DebugSession {
 
     private flushPendingCommands(): void {
         if (!this.connected || !this.socket || this.commandInFlight) return;
-
         const command = this.pendingCommands.shift();
         if (!command) return;
-
         this.commandInFlight = true;
         this.output(`VICE <= ${command}`);
-        // The VICE text monitor is line-oriented and only reliably accepts the
-        // next command once it has printed a prompt for the previous one.
         this.socket.write(`${command}\r\n`);
     }
 
     private processViceResponse(data: string): void {
-        const text = data.trim();
-        if (text) this.output(`VICE => ${text}`);
-        // VICE emits an initial monitor prompt such as (C:$e118) when the
-        // monitor opens. A prompt alone is not a DAP stop. Only report a
-        // breakpoint stop when the shown PC is one of the addresses we armed.
-        // BREAK: ... (Stop on exec) is the command acknowledgement, not a hit.
-        const stoppedAt = /(?:\b|\()C:\$([0-9a-f]{4,6})\)/i.exec(data);
-        if (stoppedAt) {
-            // A monitor prompt means the preceding command has completed.
-            this.commandInFlight = false;
-        }
-        if (stoppedAt && !/BREAK:\s*\d+.*Stop on exec/i.test(data)) {
-            const address = Number.parseInt(stoppedAt[1], 16);
+        const lines = data.split('\n');
+        for (const line of lines) {
+            const text = line.trim();
+            if (text) this.output(`VICE => ${text}`);
+            const regMatch = /A:([0-9a-f]{2})\s+X:([0-9a-f]{2})\s+Y:([0-9a-f]{2})\s+SP:([0-9a-f]{2})/i.exec(text);
+            if (regMatch) {
+                this.lastRegisters = { A: '$' + regMatch[1], X: '$' + regMatch[2], Y: '$' + regMatch[3], SP: '$' + regMatch[4] };
+            }
+            const stoppedAt = /(?:\b|\()C:\$([0-9a-f]{4,6})\)/i.exec(text);
+            if (stoppedAt) {
+                this.commandInFlight = false;
+                this.lastStoppedAddress = Number.parseInt(stoppedAt[1], 16);
+            }
+
+            if (this.stepOverState && this.stepOverState.waitingForDisassembly) {
+                // Look for memory response line: "> 040e 20" or ">C:040e ea"
+                const memMatch = /^\s*>\s*[C:]{0,2}\s*[0-9a-f]{4}\s+([0-9a-f]{2})/i.exec(text);
+                if (memMatch) {
+                    const opcode = memMatch[1];
+                    this.output(`DEBUG: memory read at PC $${this.stepOverState.address.toString(16)}: opcode $${opcode}`);
+
+                if (opcode === '20') {
+                    const nextAddr = (this.lastStoppedAddress || 0) + 3;
+                    this.output(`Step Over triggered: JSR ($20) detected, setting break at $${nextAddr.toString(16)} then continuing`);
+                    this.sendViceCommand(`break $${nextAddr.toString(16)}`);
+                    this.sendViceCommand('g');
+                } else {
+                        this.output(`Step Over: No JSR, stepping.`);
+                        this.sendViceCommand('z');
+                    }
+                    this.stepOverState = undefined;
+                    this.flushPendingCommands();
+                }
+            }
+
+            if (stoppedAt && !/BREAK:\s*\d+.*Stop on exec/i.test(text)) {
+                const address = this.lastStoppedAddress!;
             if (this.stepInProgress) {
                 this.stepInProgress = false;
-                this.lastStoppedAddress = address;
-                this.output(`VICE completed step at $${stoppedAt[1]}.`);
+                this.output(`VICE completed step at $${address.toString(16)}.`);
                 this.sendEvent(new StoppedEvent('step', 1));
             } else if (this.armedBreakpointAddresses.has(address)) {
-                this.lastStoppedAddress = address;
-                this.output(`VICE hit breakpoint at $${stoppedAt[1]}.`);
+                this.output(`VICE hit breakpoint at $${address.toString(16)}.`);
                 this.sendEvent(new StoppedEvent('breakpoint', 1));
-            } else {
-                this.output(`Ignoring monitor prompt at $${stoppedAt[1]}; it is not an armed source breakpoint.`);
+            }
+            } else if (stoppedAt && /BREAK:\s*\d+.*Stop on exec/i.test(text)) {
+                this.sendViceCommand('g');
             }
         }
         this.flushPendingCommands();
