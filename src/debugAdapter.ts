@@ -50,11 +50,13 @@ export class ViceDebugSession extends DebugSession {
             supportsConfigurationDoneRequest: true,
             supportsTerminateRequest: true,
             supportsStepInTargetsRequest: true,
-            supportsStepBack: false
+            supportsStepBack: false,
+            supportsSetVariable: true
         };
         this.sendResponse(response);
         this.sendEvent(new InitializedEvent());
     }
+
 
     protected dispatchRequest(request: DebugProtocol.Request): void {
         this.output(`DEBUG: PROTOCOL RECEIVED command=${request.command} args=${JSON.stringify(request.arguments)}`);
@@ -75,42 +77,68 @@ export class ViceDebugSession extends DebugSession {
         if (args.variablesReference === 1) {
             // Display order: PC, SP, A, X, Y, P
             if (this.lastStoppedAddress !== undefined) {
-                variables.push({ name: 'PC', value: '$' + this.lastStoppedAddress.toString(16).padStart(4, '0'), variablesReference: 0 });
+                variables.push({
+                    name: 'PC',
+                    value: '$' + this.lastStoppedAddress.toString(16).padStart(4, '0'),
+                    variablesReference: 0,
+                    type: 'register'
+                });
             }
             for (const key of ['SP', 'A', 'X', 'Y'] as const) {
                 const value = this.lastRegisters[key];
                 if (value !== undefined) {
-                    variables.push({ name: key, value, variablesReference: 0 });
+                    variables.push({ name: key, value, variablesReference: 0, type: 'register' });
                 }
             }
             if (this.lastRegisters['P'] !== undefined || this.lastP !== undefined) {
-                const pValue = this.lastRegisters['P']
-                    ?? (this.lastP !== undefined ? '$' + this.lastP.toString(16).padStart(2, '0') : undefined);
-                if (pValue !== undefined) {
+                const p = this.normalizedP();
+                if (p !== undefined) {
                     variables.push({
                         name: 'P',
-                        value: pValue,
+                        value: '$' + p.toString(16).padStart(2, '0'),
                         variablesReference: ViceDebugSession.P_FLAGS_REF,
-                        namedVariables: ViceDebugSession.FLAG_NAMES.length
+                        namedVariables: ViceDebugSession.FLAG_NAMES.length,
+                        type: 'register'
                     });
                 }
             }
         } else if (args.variablesReference === ViceDebugSession.P_FLAGS_REF) {
-
-            const p = this.lastP ?? 0;
+            const p = this.normalizedP() ?? 0x20;
             for (let i = 0; i < ViceDebugSession.FLAG_NAMES.length; i++) {
+                const name = ViceDebugSession.FLAG_NAMES[i];
                 const bit = 7 - i;
-                const set = (p & (1 << bit)) !== 0;
+                // Unused bit 5 ('-') is always shown as 1 and is not meant to be edited.
+                const set = name === '-' ? true : (p & (1 << bit)) !== 0;
                 variables.push({
-                    name: ViceDebugSession.FLAG_NAMES[i],
+                    name,
                     value: set ? '1' : '0',
-                    variablesReference: 0
+                    variablesReference: 0,
+                    type: 'flag',
+                    // Hint that '-' is not writable; setVariable still enforces this.
+                    presentationHint: name === '-' ? { attributes: ['readOnly'] } : undefined
                 });
             }
         }
         response.body = { variables };
         this.sendResponse(response);
     }
+
+    protected setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): void {
+        try {
+            if (args.variablesReference === 1) {
+                this.setRegisterVariable(response, args.name, args.value);
+                return;
+            }
+            if (args.variablesReference === ViceDebugSession.P_FLAGS_REF) {
+                this.setFlagVariable(response, args.name, args.value);
+                return;
+            }
+            this.sendErrorResponse(response, 1100, `Cannot set variable in scope ${args.variablesReference}.`);
+        } catch (error) {
+            this.sendErrorResponse(response, 1101, error instanceof Error ? error.message : String(error));
+        }
+    }
+
 
     protected launchRequest(response: DebugProtocol.LaunchResponse, args: any): void {
         const vicePath = args.vicePath || 'xpet';
@@ -340,12 +368,16 @@ export class ViceDebugSession extends DebugSession {
             //   A:00 X:00 Y:00 SP:f6 P:30 NV-BDIZC
             const regMatch = /A:([0-9a-f]{2})\s+X:([0-9a-f]{2})\s+Y:([0-9a-f]{2})\s+SP:([0-9a-f]{2})(?:\s+(?:P:\$?([0-9a-f]{2})\s*)?([NVBDIZC.\-]{8}))?/i.exec(text);
             if (regMatch) {
+                // Register dumps (including replies to `r ...=...`) should release the command queue
+                // even when they are not a full "stopped" event.
+                this.commandInFlight = false;
                 this.lastRegisters = {
                     A: '$' + regMatch[1],
                     X: '$' + regMatch[2],
                     Y: '$' + regMatch[3],
                     SP: '$' + regMatch[4]
                 };
+
                 const pHex = regMatch[5];
                 const flagStr = regMatch[6];
                 if (pHex !== undefined) {
@@ -360,16 +392,18 @@ export class ViceDebugSession extends DebugSession {
                     }
                 }
                 if (this.lastP !== undefined) {
+                    this.lastP = this.forceUnusedStatusBit(this.lastP);
                     this.lastRegisters['P'] = '$' + this.lastP.toString(16).padStart(2, '0');
                 }
             } else {
                 // Standalone P:xx if registers were already known
                 const pOnly = /\bP:\$?([0-9a-f]{2})\b/i.exec(text);
                 if (pOnly) {
-                    this.lastP = Number.parseInt(pOnly[1], 16);
+                    this.lastP = this.forceUnusedStatusBit(Number.parseInt(pOnly[1], 16));
                     this.lastRegisters['P'] = '$' + this.lastP.toString(16).padStart(2, '0');
                 }
             }
+
             const stoppedAt = /(?:\b|\()C:\$([0-9a-f]{4,6})\)/i.exec(text) || /^\.C:([0-9a-f]{4})/i.exec(text);
             if (stoppedAt) {
                 this.commandInFlight = false;
@@ -396,8 +430,136 @@ export class ViceDebugSession extends DebugSession {
                 p |= (1 << (7 - i));
             }
         }
-        return p;
+        return this.forceUnusedStatusBit(p);
+    }
+
+    /** Bit 5 of P is unused on 6502 and is kept hard-wired to 1. */
+    private forceUnusedStatusBit(p: number): number {
+        return (p & 0xff) | 0x20;
+    }
+
+    private normalizedP(): number | undefined {
+        if (this.lastP !== undefined) {
+            return this.forceUnusedStatusBit(this.lastP);
+        }
+        const raw = this.lastRegisters['P'];
+        if (raw === undefined) {
+            return undefined;
+        }
+        return this.forceUnusedStatusBit(this.parseInteger(raw, 0xff));
+    }
+
+
+    private setRegisterVariable(response: DebugProtocol.SetVariableResponse, name: string, rawValue: string): void {
+        const reg = name.toUpperCase();
+        if (reg === 'PC') {
+            const value = this.parseInteger(rawValue, 0xffff);
+            this.lastStoppedAddress = value;
+            this.sendViceCommand(`r pc=$${value.toString(16).padStart(4, '0')}`);
+            response.body = {
+                value: '$' + value.toString(16).padStart(4, '0'),
+                variablesReference: 0
+            };
+            this.sendResponse(response);
+            return;
+        }
+
+        if (reg === 'A' || reg === 'X' || reg === 'Y' || reg === 'SP') {
+            const value = this.parseInteger(rawValue, 0xff);
+            const formatted = '$' + value.toString(16).padStart(2, '0');
+            this.lastRegisters[reg] = formatted;
+            const viceName = reg === 'SP' ? 'sp' : reg.toLowerCase();
+            this.sendViceCommand(`r ${viceName}=$${value.toString(16).padStart(2, '0')}`);
+            response.body = { value: formatted, variablesReference: 0 };
+            this.sendResponse(response);
+            return;
+        }
+
+        if (reg === 'P') {
+            const value = this.forceUnusedStatusBit(this.parseInteger(rawValue, 0xff));
+            this.applyLocalP(value);
+            this.sendViceCommand(`r fl=$${value.toString(16).padStart(2, '0')}`);
+            response.body = {
+                value: '$' + value.toString(16).padStart(2, '0'),
+                variablesReference: ViceDebugSession.P_FLAGS_REF,
+                namedVariables: ViceDebugSession.FLAG_NAMES.length
+            };
+            this.sendResponse(response);
+            return;
+        }
+
+        throw new Error(`Unknown register "${name}".`);
+    }
+
+    private setFlagVariable(response: DebugProtocol.SetVariableResponse, name: string, rawValue: string): void {
+        const flag = name.toUpperCase() === '-' ? '-' : name.toUpperCase();
+        if (flag === '-') {
+            throw new Error('The unused status bit (-) is hard-wired to 1 and cannot be changed.');
+        }
+
+        const index = ViceDebugSession.FLAG_NAMES.indexOf(flag as typeof ViceDebugSession.FLAG_NAMES[number]);
+        if (index < 0) {
+            throw new Error(`Unknown flag "${name}".`);
+        }
+
+        const bitValue = this.parseFlagBit(rawValue);
+        const bit = 7 - index;
+        const current = this.normalizedP() ?? 0x20;
+        const next = this.forceUnusedStatusBit(bitValue ? (current | (1 << bit)) : (current & ~(1 << bit)));
+        this.applyLocalP(next);
+        this.sendViceCommand(`r fl=$${next.toString(16).padStart(2, '0')}`);
+        response.body = {
+            value: bitValue ? '1' : '0',
+            variablesReference: 0
+        };
+        this.sendResponse(response);
+    }
+
+    private applyLocalP(value: number): void {
+        this.lastP = this.forceUnusedStatusBit(value);
+        this.lastRegisters['P'] = '$' + this.lastP.toString(16).padStart(2, '0');
+    }
+
+    /** Accepts $ff, 0xff, ff, or decimal. */
+    private parseInteger(rawValue: string, max: number): number {
+        const text = rawValue.trim().toLowerCase();
+        if (!text) {
+            throw new Error('Value cannot be empty.');
+        }
+
+        let value: number;
+        if (text.startsWith('$')) {
+            value = Number.parseInt(text.slice(1), 16);
+        } else if (text.startsWith('0x')) {
+            value = Number.parseInt(text.slice(2), 16);
+        } else if (/^[0-9a-f]+$/i.test(text) && /[a-f]/i.test(text)) {
+            value = Number.parseInt(text, 16);
+        } else if (/^\d+$/.test(text)) {
+            value = Number.parseInt(text, 10);
+        } else if (/^[0-9a-f]+$/i.test(text)) {
+            // Pure hex digits with no prefix — treat as hex for register UX ($ omitted).
+            value = Number.parseInt(text, 16);
+        } else {
+            throw new Error(`Invalid numeric value "${rawValue}". Use hex ($3a / 0x3a / 3a) or decimal.`);
+        }
+
+        if (!Number.isFinite(value) || value < 0 || value > max) {
+            throw new Error(`Value "${rawValue}" is out of range (0..$${max.toString(16)}).`);
+        }
+        return value;
+    }
+
+    private parseFlagBit(rawValue: string): boolean {
+        const text = rawValue.trim().toLowerCase();
+        if (text === '1' || text === 'true' || text === 'on' || text === 'set') {
+            return true;
+        }
+        if (text === '0' || text === 'false' || text === 'off' || text === 'clear') {
+            return false;
+        }
+        throw new Error(`Invalid flag value "${rawValue}". Use 0 or 1.`);
     }
 }
+
 
 DebugSession.run(ViceDebugSession);
